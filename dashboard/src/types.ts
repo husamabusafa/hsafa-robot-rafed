@@ -40,6 +40,69 @@ export interface LineComponent {
   span?: number;
 }
 
+export interface PieComponent {
+  type: "pie";
+  title: string;
+  data: ChartDataPoint[];
+  span?: number;
+}
+
+export interface AreaSeries {
+  name: string;
+  color?: string;
+  data: { label: string; value: number }[];
+}
+
+export interface AreaComponent {
+  type: "area";
+  title: string;
+  series: AreaSeries[];
+  xLabel?: string;
+  yLabel?: string;
+  stacked?: boolean;
+  span?: number;
+}
+
+export interface RadarDataPoint {
+  label: string;
+  value: number;
+}
+
+export interface RadarSeries {
+  name: string;
+  color?: string;
+  data: RadarDataPoint[];
+}
+
+export interface RadarComponent {
+  type: "radar";
+  title: string;
+  series: RadarSeries[];
+  max?: number;
+  span?: number;
+}
+
+export interface ScatterDataPoint {
+  x: number;
+  y: number;
+  label?: string;
+}
+
+export interface ScatterSeries {
+  name: string;
+  color?: string;
+  data: ScatterDataPoint[];
+}
+
+export interface ScatterComponent {
+  type: "scatter";
+  title: string;
+  series: ScatterSeries[];
+  xLabel?: string;
+  yLabel?: string;
+  span?: number;
+}
+
 export interface TableColumn {
   key: string;
   label: string;
@@ -87,6 +150,10 @@ export type DashboardComponent =
   | DonutComponent
   | BarComponent
   | LineComponent
+  | PieComponent
+  | AreaComponent
+  | RadarComponent
+  | ScatterComponent
   | TableComponent
   | ProgressComponent
   | StatusGridComponent;

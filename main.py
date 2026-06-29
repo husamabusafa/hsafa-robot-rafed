@@ -501,13 +501,24 @@ class UnifiedBridge:
                 "name": "show_expression",
                 "description": (
                     "Show an animated emotion clip with head motion and sound. "
-                    "Valid names: amazed, angry, anxiety, attentive, boredom, calming, cheerful, come, "
-                    "confused, contempt, curious, dance, disgusted, displeased, downcast, dying, electric, "
-                    "enthusiastic, exhausted, fear, frustrated, furious, go_away, grateful, happy, helpful, "
-                    "impatient, indifferent, inquiring, irritated, laughing, lonely, lost, love, neutral, "
-                    "no, oops, proud, rage, relief, reprimand, resigned, sad, scared, serenity, shy, "
-                    "sleep, success, surprised, thoughtful, tired, uncertain, uncomfortable, understanding, "
-                    "welcoming, yes."
+                    "Valid names (use the number suffix): amazed1, anxiety1, "
+                    "attentive1, attentive2, boredom1, boredom2, calming1, "
+                    "cheerful1, come1, confused1, contempt1, curious1, "
+                    "dance1, dance2, dance3, disgusted1, displeased1, "
+                    "displeased2, downcast1, dying1, electric1, "
+                    "enthusiastic1, enthusiastic2, exhausted1, fear1, "
+                    "frustrated1, furious1, go_away1, grateful1, helpful1, "
+                    "helpful2, impatient1, impatient2, indifferent1, "
+                    "inquiring1, inquiring2, inquiring3, irritated1, "
+                    "irritated2, laughing1, laughing2, lonely1, lost1, "
+                    "loving1, no1, no_excited1, no_sad1, oops1, oops2, "
+                    "proud1, proud2, proud3, rage1, relief1, relief2, "
+                    "reprimand1, reprimand2, reprimand3, resigned1, sad1, "
+                    "sad2, scared1, serenity1, shy1, sleep1, success1, "
+                    "success2, surprised1, surprised2, thoughtful1, "
+                    "thoughtful2, tired1, uncertain1, uncomfortable1, "
+                    "understanding1, understanding2, welcoming1, "
+                    "welcoming2, yes1, yes_sad1."
                 ),
                 "input": {
                     "emotion": "string",
@@ -652,11 +663,76 @@ class UnifiedBridge:
     async def _handle_show_expression(self, args: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
         name = args.get("emotion", "neutral")
         valid = self.robot.list_expressions()
-        if name not in valid:
-            return {"ok": False, "error": f"Unknown emotion '{name}'. Valid: {valid}"}
-        await asyncio.to_thread(self.robot.show_expression, name)
-        log.info("[Haseef tool] show_expression: %s", name)
-        return {"ok": True, "emotion": name}
+
+        # Exact match
+        if name in valid:
+            resolved = name
+        else:
+            # Fuzzy: try prefix (e.g. "sad" -> "sad1", "surprised" -> "surprised1")
+            matches = [v for v in valid if v.startswith(name)]
+            if matches:
+                resolved = matches[0]
+            else:
+                # Synonym map for common names without number suffix
+                synonyms = {
+                    "happy": "cheerful1", "cheerful": "cheerful1",
+                    "surprised": "surprised1", "amazed": "amazed1",
+                    "bored": "boredom1", "boredom": "boredom1",
+                    "calm": "calming1", "calming": "calming1",
+                    "attentive": "attentive1",
+                    "neutral": "attentive1",
+                    "angry": "furious1", "mad": "furious1",
+                    "sad": "sad1", "depressed": "sad2",
+                    "scared": "scared1", "afraid": "scared1",
+                    "tired": "tired1", "sleepy": "sleep1",
+                    "confused": "confused1",
+                    "curious": "curious1",
+                    "proud": "proud1",
+                    "grateful": "grateful1",
+                    "laughing": "laughing1", "laugh": "laughing1",
+                    "love": "loving1", "loving": "loving1",
+                    "welcome": "welcoming1", "welcoming": "welcoming1",
+                    "yes": "yes1", "no": "no1",
+                    "helpful": "helpful1",
+                    "understanding": "understanding1",
+                    "shy": "shy1",
+                    "relief": "relief1", "relieved": "relief1",
+                    "enthusiastic": "enthusiastic1",
+                    "exhausted": "exhausted1",
+                    "lonely": "lonely1",
+                    "lost": "lost1",
+                    "rage": "rage1", "furious": "furious1",
+                    "irritated": "irritated1",
+                    "frustrated": "frustrated1",
+                    "impatient": "impatient1",
+                    "indifferent": "indifferent1",
+                    "inquiring": "inquiring1",
+                    "resigned": "resigned1",
+                    "uncertain": "uncertain1",
+                    "uncomfortable": "uncomfortable1",
+                    "disgusted": "disgusted1",
+                    "displeased": "displeased1",
+                    "downcast": "downcast1",
+                    "contempt": "contempt1",
+                    "fear": "fear1",
+                    "anxiety": "anxiety1",
+                    "dying": "dying1",
+                    "electric": "electric1",
+                    "go_away": "go_away1",
+                    "oops": "oops1",
+                    "reprimand": "reprimand1",
+                    "scared": "scared1",
+                    "serenity": "serenity1",
+                    "success": "success1",
+                    "thoughtful": "thoughtful1",
+                }
+                resolved = synonyms.get(name.lower())
+                if not resolved:
+                    return {"ok": False, "error": f"Unknown emotion '{name}'. Valid: {valid}"}
+
+        await asyncio.to_thread(self.robot.show_expression, resolved)
+        log.info("[Haseef tool] show_expression: %s -> %s", name, resolved)
+        return {"ok": True, "emotion": resolved}
 
     async def _handle_look_around(
         self, args: Dict[str, Any], ctx: Dict[str, Any]

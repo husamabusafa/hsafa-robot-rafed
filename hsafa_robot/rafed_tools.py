@@ -287,7 +287,8 @@ TOOL_DEFS: List[Dict[str, Any]] = [
             "Display a complete visual dashboard on the robot's screen in one call. "
             "Use this for simple views with few components. "
             "For richer dashboards, use dashboard_init + dashboard_add instead. "
-            "Components: kpi, donut, bar, line, table, progress, status-grid. "
+            "Components: kpi, donut, pie, bar, line, area, radar, scatter, "
+            "table, progress, status-grid. "
             "Layout columns: 1-4. Each component can span multiple columns."
         ),
         "input": {
@@ -321,7 +322,8 @@ TOOL_DEFS: List[Dict[str, Any]] = [
             "The component appears immediately with animation. "
             "Call dashboard_init first, then call this multiple times to build "
             "the view piece by piece. Each call adds one component. "
-            "Component types: kpi, donut, bar, line, table, progress, status-grid."
+            "Component types: kpi, donut, pie, bar, line, area, radar, scatter, "
+            "table, progress, status-grid."
         ),
         "input": {
             "component": "object",

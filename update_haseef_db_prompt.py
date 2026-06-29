@@ -323,9 +323,13 @@ COMPONENT TYPES:
 2. Donut chart: {"type": "donut", "title": "...", "data": [{"label": "...", "value": number}], "centerLabel": "...", "centerValue": "..."}
 3. Bar chart: {"type": "bar", "title": "...", "data": [{"label": "...", "value": number}], "horizontal": false}
 4. Line chart: {"type": "line", "title": "...", "data": [{"label": "...", "value": number}]}
-5. Table: {"type": "table", "title": "...", "columns": [{"key": "...", "label": "...", "align": "right|left|center"}], "rows": [{...}]}
-6. Progress bars: {"type": "progress", "title": "...", "items": [{"label": "...", "value": number, "max": number, "color": "blue|green|orange|red"}]}
-7. Status grid: {"type": "status-grid", "title": "...", "items": [{"label": "...", "value": "...", "status": "good|warning|bad|neutral"}], "columns": 3}
+5. Pie chart: {"type": "pie", "title": "...", "data": [{"label": "...", "value": number, "color": "#hex"}]}
+6. Area chart: {"type": "area", "title": "...", "series": [{"name": "...", "color": "#hex", "data": [{"label": "...", "value": number}]}], "stacked": false}
+7. Radar chart: {"type": "radar", "title": "...", "series": [{"name": "...", "color": "#hex", "data": [{"label": "...", "value": number}]}], "max": 100}
+8. Scatter chart: {"type": "scatter", "title": "...", "series": [{"name": "...", "color": "#hex", "data": [{"x": number, "y": number, "label": "..."}]}], "xLabel": "...", "yLabel": "..."}
+9. Table: {"type": "table", "title": "...", "columns": [{"key": "...", "label": "...", "align": "right|left|center"}], "rows": [{...}]}
+10. Progress bars: {"type": "progress", "title": "...", "items": [{"label": "...", "value": number, "max": number, "color": "blue|green|orange|red"}]}
+11. Status grid: {"type": "status-grid", "title": "...", "items": [{"label": "...", "value": "...", "status": "good|warning|bad|neutral"}], "columns": 3}
 
 EXAMPLE — Fleet overview (incremental):
 dashboard_init(title="نظرة عامة على الأسطول", columns=3)
@@ -344,13 +348,17 @@ RULES:
 - Call dashboard_init BEFORE say_this so the screen is ready.
 - Add components in logical order: KPIs first, then charts, then tables.
 - Keep it simple: 2-6 components per view.
-- ALWAYS include at least one CHART (donut, bar, or line) when you have data
+- ALWAYS include at least one CHART (donut, pie, bar, line, or area) when you have data
   that can be visualized. Do NOT use only KPI cards. The screen should look
   rich and visual, not just numbers.
 - Use KPI cards for single headline numbers (1-3 max).
-- Use DONUT charts for percentages and proportions (e.g. GPS coverage, compliance rate).
+- Use DONUT charts for percentages and proportions with a center label (e.g. GPS coverage, compliance rate).
+- Use PIE charts for simple proportional breakdowns without a center label.
 - Use BAR charts for comparisons across categories (e.g. accidents by sector, students by contract).
 - Use LINE charts for trends over time (e.g. monthly accidents, daily visits).
+- Use AREA charts for cumulative or stacked trends over time (e.g. monthly volume by region).
+- Use RADAR charts for multi-dimensional comparison (e.g. operator performance across safety, cost, coverage).
+- Use SCATTER charts for correlation between two metrics (e.g. vehicle age vs. maintenance cost).
 - Use TABLES for detailed lists (max 12 rows shown).
 - Use PROGRESS bars for completion/gap metrics.
 - Use STATUS GRID for multi-item health/compliance checks.

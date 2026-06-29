@@ -1,16 +1,30 @@
+import { useState } from "react";
 import { motion } from "framer-motion";
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip } from "recharts";
 import type { DonutComponent } from "../types";
 
-const DEFAULT_COLORS = ["#3377ff", "#8ec1ff", "#f59e0b", "#10b981", "#ef4444", "#a855f7"];
+const DEFAULT_COLORS = ["#3377ff", "#8ec1ff", "#f59e0b", "#10b981", "#ef4444", "#a855f7", "#06b6d4"];
 
 export function DonutChart({ comp, index }: { comp: DonutComponent; index: number }) {
+  const [activeIndex, setActiveIndex] = useState<number | null>(null);
+  const [hidden, setHidden] = useState<Set<number>>(new Set());
+
   const data = comp.data.map((d, i) => ({
     name: d.label,
     value: d.value,
     fill: d.color || DEFAULT_COLORS[i % DEFAULT_COLORS.length],
   }));
-  const total = data.reduce((sum, d) => sum + d.value, 0);
+  const visibleData = data.filter((_, i) => !hidden.has(i));
+  const total = visibleData.reduce((sum, d) => sum + d.value, 0);
+
+  const toggleSlice = (i: number) => {
+    setHidden((prev) => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+  };
 
   return (
     <motion.div
@@ -24,7 +38,7 @@ export function DonutChart({ comp, index }: { comp: DonutComponent; index: numbe
         <ResponsiveContainer width="100%" height="100%">
           <PieChart>
             <Pie
-              data={data}
+              data={visibleData}
               cx="50%"
               cy="50%"
               innerRadius="55%"
@@ -32,9 +46,18 @@ export function DonutChart({ comp, index }: { comp: DonutComponent; index: numbe
               paddingAngle={2}
               dataKey="value"
               stroke="none"
+              onMouseEnter={(_, i) => setActiveIndex(i)}
+              onMouseLeave={() => setActiveIndex(null)}
+              animationBegin={index * 80}
+              animationDuration={600}
             >
-              {data.map((entry, i) => (
-                <Cell key={i} fill={entry.fill} />
+              {visibleData.map((entry, i) => (
+                <Cell
+                  key={i}
+                  fill={entry.fill}
+                  opacity={activeIndex === null || activeIndex === i ? 1 : 0.4}
+                  style={{ transition: "opacity 0.2s", cursor: "pointer" }}
+                />
               ))}
             </Pie>
             <Tooltip
@@ -66,10 +89,16 @@ export function DonutChart({ comp, index }: { comp: DonutComponent; index: numbe
       </div>
       <div className="flex flex-wrap gap-2 mt-2 justify-center">
         {data.map((d, i) => (
-          <div key={i} className="flex items-center gap-1.5 text-xs text-slate-400">
+          <button
+            key={i}
+            onClick={() => toggleSlice(i)}
+            className={`flex items-center gap-1.5 text-xs transition-opacity ${
+              hidden.has(i) ? "opacity-40" : "opacity-100"
+            } hover:opacity-80`}
+          >
             <span className="w-2.5 h-2.5 rounded-full" style={{ background: d.fill }} />
-            <span className="font-arabic">{d.name}</span>
-          </div>
+            <span className="font-arabic text-slate-400">{d.name}</span>
+          </button>
         ))}
       </div>
     </motion.div>

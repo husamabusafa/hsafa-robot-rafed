@@ -153,6 +153,20 @@ class RobotController:
         """
         self._speaking_event = event
 
+    # ---- safe command wrappers ---------------------------------------------
+    # These check _expression_active right before sending so the idle loop
+    # never fights with a playing expression clip, even if the flag was set
+    # mid-cycle (after the top-of-loop check but before the send).
+    def _send_head_pose(self, pose) -> None:
+        if self._expression_active.is_set():
+            return
+        self.reachy.set_target_head_pose(pose)
+
+    def _send_antennas(self, positions) -> None:
+        if self._expression_active.is_set():
+            return
+        self.reachy.set_target_antenna_joint_positions(positions)
+
     def notify_audio(self, samples) -> None:
         """Update the live speech amplitude used to scale motion.
 
@@ -261,23 +275,59 @@ class RobotController:
             face_yaw = None
             face_pitch = None
 
-            # Haseef working AND not speaking — radar-sweep antennas.
+            # Haseef working AND not speaking — radar-sweep antennas + face tracking.
             if self._haseef_working.is_set() and not speaking:
-                # Smooth radar sweep: antennas rotate side to side
+                # Face tracking — same logic as idle branch
+                if self._tracker is not None and (self._frame_source is not None or self._camera is not None):
+                    frame = self._frame_source() if self._frame_source is not None else self._camera.grab()
+                    if frame is not None:
+                        self._tracker.submit(frame)
+                    det = self._tracker.get()
+                    now_ts = time.time()
+                    if det is not None and (now_ts - det.timestamp) < _TRACK_COAST_S:
+                        ex = det.err_x
+                        ey = det.err_y
+                        self._track_smooth_ex += 0.5 * (ex - self._track_smooth_ex)
+                        self._track_smooth_ey += 0.5 * (ey - self._track_smooth_ey)
+                        sx = self._track_smooth_ex
+                        sy = self._track_smooth_ey
+                        if abs(sx) > _TRACK_DEADZONE:
+                            face_yaw = self._track_yaw + _YAW_SIGN * sx * _HALF_HFOV * _TRACK_LEAD_GAIN
+                        if abs(sy) > _TRACK_DEADZONE:
+                            face_pitch = self._track_pitch + _PITCH_SIGN * sy * _HALF_VFOV * _TRACK_LEAD_GAIN
+                        self._track_last_seen = now_ts
+
+                if face_yaw is not None:
+                    face_yaw = max(-_YAW_LIMIT, min(_YAW_LIMIT, face_yaw))
+                    self._track_yaw += _TRACK_ALPHA * (face_yaw - self._track_yaw)
+                else:
+                    if (time.time() - self._track_last_seen) > _TRACK_RECENTER_AFTER_S:
+                        self._track_yaw *= _TRACK_RECENTER_DECAY
+
+                if face_pitch is not None:
+                    face_pitch = max(-_PITCH_LIMIT, min(_PITCH_LIMIT, face_pitch))
+                    self._track_pitch += _TRACK_ALPHA * (face_pitch - self._track_pitch)
+                else:
+                    if (time.time() - self._track_last_seen) > _TRACK_RECENTER_AFTER_S:
+                        self._track_pitch *= _TRACK_RECENTER_DECAY
+
+                # Head follows face (or stays neutral if no face)
+                roll = 0.5 * math.sin(2 * math.pi * t / 9.0)
+                pose = create_head_pose(
+                    roll=roll,
+                    pitch=math.degrees(self._track_pitch),
+                    yaw=math.degrees(self._track_yaw),
+                    degrees=True,
+                    mm=True,
+                )
+                self._send_head_pose(pose)
+
+                # Radar-sweep antennas: rotate side to side
                 sweep = math.sin(2 * math.pi * t * 0.8)
                 ant_amp = math.radians(25.0)
                 ant_r = ant_amp * sweep
                 ant_l = -ant_amp * sweep
-                self.reachy.set_target_antenna_joint_positions([ant_r, ant_l])
-
-                pose = create_head_pose(
-                    roll=0,
-                    pitch=0,
-                    yaw=0,
-                    degrees=True,
-                    mm=True,
-                )
-                self.reachy.set_target_head_pose(pose)
+                self._send_antennas([ant_r, ant_l])
                 time.sleep(0.02)
                 continue
 
@@ -350,7 +400,7 @@ class RobotController:
                         degrees=True,
                         mm=True,
                     )
-                self.reachy.set_target_head_pose(pose)
+                self._send_head_pose(pose)
 
                 # Talking antennas: speech-rhythm sway, amplitude follows
                 # audio level so quiet speech = small movement, loud = bigger.
@@ -358,7 +408,7 @@ class RobotController:
                 ant_phase = 2 * math.pi * t * 2.2
                 ant_r = ant_amp * math.sin(ant_phase)
                 ant_l = ant_amp * math.sin(ant_phase + math.pi * 0.7)
-                self.reachy.set_target_antenna_joint_positions([ant_r, ant_l])
+                self._send_antennas([ant_r, ant_l])
             else:
                 # Idle: face tracking if tracker+camera available, else drift.
 
@@ -405,10 +455,10 @@ class RobotController:
                         degrees=True,
                         mm=True,
                     )
-                    self.reachy.set_target_head_pose(pose)
+                    self._send_head_pose(pose)
                     ant_r = 0.12 * math.sin(2 * math.pi * t / 6.5)
                     ant_l = 0.12 * math.sin(2 * math.pi * t / 7.1 + 0.8)
-                    self.reachy.set_target_antenna_joint_positions([ant_r, ant_l])
+                    self._send_antennas([ant_r, ant_l])
                 else:
                     # No tracker — original drift behavior
                     if t > next_drift:
@@ -423,10 +473,10 @@ class RobotController:
                         degrees=True,
                         mm=True,
                     )
-                    self.reachy.set_target_head_pose(pose)
+                    self._send_head_pose(pose)
                     ant_r = 0.12 * math.sin(2 * math.pi * t / 6.5)
                     ant_l = 0.12 * math.sin(2 * math.pi * t / 7.1 + 0.8)
-                    self.reachy.set_target_antenna_joint_positions([ant_r, ant_l])
+                    self._send_antennas([ant_r, ant_l])
 
             time.sleep(0.02)  # ~50 Hz
 
@@ -440,22 +490,23 @@ class RobotController:
     def show_expression(self, name: str) -> bool:
         """Play a recorded emotion clip (motion + sound).
 
-        Pauses the animation loop, plays the clip, then smoothly returns to neutral.
+        Pauses the animation loop and plays the clip at its natural duration.
+        Works even if speaking or idle animation is running — the expression
+        takes full priority until it finishes.
         """
         try:
-            from reachy_mini.utils import create_head_pose
-
             self._expression_active.set()
+            # Give the idle loop one cycle to see the flag and yield so
+            # it doesn't send a conflicting head pose mid-expression.
+            time.sleep(0.06)
             moves = self._load_emotions()
             move = moves.get(name)
-            self.reachy.play_move(move, initial_goto_duration=0.5, sound=True)
+            if move is None:
+                self._expression_active.clear()
+                log.warning("Expression '%s' not found in library", name)
+                return False
+            self.reachy.play_move(move, sound=True)
             log.info("Played emotion '%s' (%.2fs)", name, move.duration)
-
-            # Smoothly return to neutral before resuming idle/speaking
-            self.reachy.goto_target(
-                head=create_head_pose(roll=0, pitch=0, yaw=0, degrees=True, mm=True),
-                duration=1.5,
-            )
             self._expression_active.clear()
             return True
         except Exception as e:
@@ -476,6 +527,7 @@ class RobotController:
     def move_head(self, yaw_deg: float, pitch_deg: float, duration: float = 0.3) -> None:
         """Smoothly move the head to a yaw/pitch angle (degrees)."""
         self._expression_active.set()
+        time.sleep(0.06)
         self.reachy.goto_target(
             head=head_pose(
                 roll=0.0,
