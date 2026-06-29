@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Models (downloaded automatically)
+models/
+
+# Logs
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Reachy daemon
+*.pid
+
+# Database dumps
+*.sql
+
+# Dashboard build deps
+dashboard/node_modules/
+dashboard/dist/
