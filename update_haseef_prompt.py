@@ -31,7 +31,10 @@ NEW_EXPRESSION_TOOL = """- show_expression(emotion): Show an animated emotion cl
   welcoming1, welcoming2, yes1, yes_sad1.
   Common mappings: angry→furious1, happy→cheerful1, sad→sad1,
   surprised→surprised1, scared→scared1, tired→tired1, bored→boredom1,
-  calm→calming1, confused→confused1, proud→proud1, laughing→laughing1."""
+  calm→calming1, confused→confused1, proud→proud1, laughing→laughing1.
+  IMPORTANT: When the task is ONLY to show an emotion, call show_expression
+  and do NOT call say_this. Gemini already spoke to the user — no extra
+  speech is needed. Just play the emotion and finish."""
 
 
 async def main():

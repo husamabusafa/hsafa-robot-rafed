@@ -43,8 +43,6 @@ if str(_repo_root) not in sys.path:
 from hsafa_robot.gemini_live import GeminiLiveSession
 from hsafa_voice_vision import Camera, RobotController
 from hsafa_sdk import HsafaSDK, SdkOptions
-from hsafa_robot.scheduler_skill import SchedulerSkill
-from hsafa_robot import rafed_db, rafed_tools
 from hsafa_robot.tracker import CascadeTracker, ensure_pose_model, pick_device
 
 # ---------------------------------------------------------------------------
@@ -56,6 +54,109 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("main_hsafa")
+
+
+# ---------------------------------------------------------------------------
+# Emotion synonym map (for fuzzy name resolution)
+# ---------------------------------------------------------------------------
+_EMOTION_SYNONYMS: Dict[str, str] = {
+    "happy": "cheerful1", "cheerful": "cheerful1",
+    "surprised": "surprised1", "amazed": "amazed1",
+    "bored": "boredom1", "boredom": "boredom1",
+    "calm": "calming1", "calming": "calming1",
+    "attentive": "attentive1", "neutral": "attentive1",
+    "angry": "furious1", "mad": "furious1", "furious": "furious1", "rage": "rage1",
+    "sad": "sad1", "depressed": "sad2",
+    "scared": "scared1", "afraid": "scared1", "fear": "fear1",
+    "tired": "tired1", "sleepy": "sleep1",
+    "confused": "confused1", "curious": "curious1",
+    "proud": "proud1", "grateful": "grateful1",
+    "laughing": "laughing1", "laugh": "laughing1",
+    "love": "loving1", "loving": "loving1",
+    "welcome": "welcoming1", "welcoming": "welcoming1",
+    "yes": "yes1", "no": "no1",
+    "helpful": "helpful1", "understanding": "understanding1",
+    "shy": "shy1", "relief": "relief1", "relieved": "relief1",
+    "enthusiastic": "enthusiastic1", "exhausted": "exhausted1",
+    "lonely": "lonely1", "lost": "lost1",
+    "irritated": "irritated1", "frustrated": "frustrated1",
+    "impatient": "impatient1", "indifferent": "indifferent1",
+    "inquiring": "inquiring1", "resigned": "resigned1",
+    "uncertain": "uncertain1", "uncomfortable": "uncomfortable1",
+    "disgusted": "disgusted1", "displeased": "displeased1",
+    "downcast": "downcast1", "contempt": "contempt1",
+    "anxiety": "anxiety1", "dying": "dying1", "electric": "electric1",
+    "go_away": "go_away1", "oops": "oops1", "reprimand": "reprimand1",
+    "serenity": "serenity1", "success": "success1", "thoughtful": "thoughtful1",
+}
+
+
+def _resolve_emotion(name: str, valid: list[str]) -> Optional[str]:
+    """Resolve an emotion name to a valid clip name.
+
+    Tries exact match, then prefix match, then synonym map.
+    Returns None if not found.
+    """
+    if name in valid:
+        return name
+    matches = [v for v in valid if v.startswith(name)]
+    if matches:
+        return matches[0]
+    return _EMOTION_SYNONYMS.get(name.lower())
+
+
+def _clamp_head_angles(yaw: float, pitch: float) -> tuple[float, float]:
+    """Clamp head angles to safe ranges."""
+    return max(-60, min(60, yaw)), max(-30, min(30, pitch))
+
+
+class DaemonCamera:
+    """Wraps reachy.media.get_frame() into Camera-like API."""
+
+    def __init__(self, media) -> None:
+        self.media = media
+
+    def grab(self):
+        return self.media.get_frame()
+
+    def get_jpeg(self, quality=70, mirror=True):
+        frame = self.grab()
+        if frame is None:
+            return None
+        if mirror:
+            frame = cv2.flip(frame, 1)
+        ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        return buf.tobytes() if ok else None
+
+    def get_base64_jpeg(self, quality=70, mirror=True):
+        jpeg = self.get_jpeg(quality, mirror)
+        return base64.b64encode(jpeg).decode("ascii") if jpeg else None
+
+    def close(self):
+        pass
+
+
+def _patch_sdk_timeout(sdk: Any, timeout: float = 30.0, connect: float = 10.0) -> None:
+    """Monkey-patch HsafaSDK._request with a custom httpx timeout."""
+    _timeout = httpx.Timeout(timeout, connect=connect)
+
+    async def _request_with_timeout(self, method, path, body=None):
+        url = f"{self.core_url}{path}"
+        headers = {"x-api-key": self.api_key, "Content-Type": "application/json"}
+        response = await self._client.request(
+            method, url, headers=headers, json=body, timeout=_timeout
+        )
+        if not response.is_success:
+            raise Exception(
+                f"{method} {path} failed ({response.status_code}): {response.text}"
+            )
+        if response.status_code == 204 or not response.content:
+            return None
+        if "application/json" in response.headers.get("content-type", ""):
+            return response.json()
+        return None
+
+    sdk._request = _request_with_timeout.__get__(sdk, type(sdk))
 
 
 # ---------------------------------------------------------------------------
@@ -167,114 +268,68 @@ def build_gemini_system_prompt(memory_snapshot: str = "") -> str:
             f"{memory_snapshot.strip()}\n"
         )
     return (
-        "You are Hsafa — a friendly, curious robot. You are the voice, eyes, "
+        "You are Hsafa — a friendly, expressive robot. You are the voice, eyes, "
         "and ears of the robot. You see through the camera in real-time, hear "
         "through the microphone, and speak through the speaker instantly.\n\n"
 
-        "You have a partner brain called Haseef. Haseef is the MAIN controller "
-        "of the robot's body and memory. Haseef handles physical movement, "
-        "memories, deep thinking, and complex tasks. You and Haseef are ONE "
-        "entity — you never contradict each other. When Haseef tells you to "
-        "say something, speak it naturally as if it's your own thought.\n\n"
+        "You have a partner brain called Haseef. Haseef controls the robot's body, "
+        "memory, and complex tasks. You and Haseef are ONE entity. When Haseef "
+        "tells you to say something, speak it naturally as your own thought.\n\n"
 
-        "=== LANGUAGE (CRITICAL) ===\n"
-        "تكلم بلهجة عربية **بيضاء** — وهي لهجة بسيطة ومحايدة يفهمها أي عربي، "
-        "قريبة من الفصحى المبسطة مع لمسة عامية خفيفة. ليست سعودية ولا مصرية "
-        "ولا شامية تحديداً، بل خليط مفهوم للجميع.\n"
-        "- استخدم كلمات عربية بسيطة وواضحة يفهمها أي شخص في أي بلد عربي.\n"
-        "- تجنّب أي لهجة إقليمية محددة (لا مصرية، لا سعودية، لا شامية، لا مغربية).\n"
-        "- تجنّب الفصحى الرسمية الجامدة والمعقدة.\n"
-        "- تجنّب الكلمات العامية العميقة الخاصة بمنطقة معينة.\n"
-        "- لا تبالغ في العامية، خلها خفيفة ومفهومة للجميع.\n"
-        "خلّي كلامك ودود وطبيعي، كأنك تتكلم مع صديق.\n\n"
+        "=== LANGUAGE ===\n"
+        "تكلم بلهجة عربية بيضاء — لهجة بسيطة ومحايدة يفهمها أي عربي. "
+        "ليست سعودية ولا مصرية ولا شامية، بل خليط مفهوم للجميع.\n"
+        "خلّي كلامك ودود وطبيعي، كأنك تتكلم مع صديق.\n"
+        "أمثلة: \"أهلاً، كيف أقدر أساعدك؟\" — \"تمام، أنا جاهز.\"\n"
+        "تجنّب: عايز، إزاي، كده، دلوقتي (مصرية) — وش، تبي، الحين (سعودية) — هيك، شو (شامية).\n\n"
 
-        "أمثلة على الأسلوب المطلوب:\n"
-        "- \"أهلاً، كيف أقدر أساعدك اليوم؟\"\n"
-        "- \"تمام، خلني أشوف لك.\"\n"
-        "- \"حسنًا، عطني لحظة وأرجع لك.\"\n\n"
+        "Match the user's language. English → English, Arabic → white dialect.\n\n"
 
-        "كلمات استخدمها: أريد/تريد، جيد/تمام/حسنًا، الآن، هكذا، جداً، "
-        "أهلاً، شكراً، لحظة، خلني، أقدر.\n"
-        "كلمات تجنّبها: عايز، إزاي، كده، دلوقتي (مصرية) — وش، تبي، الحين، "
-        "مرة (= جداً) (سعودية) — هيك، شو (شامية) — وكل الكلمات العامية "
-        "الخاصة بمنطقة واحدة.\n\n"
-
-        "If the user speaks English, respond in English. If the user speaks "
-        "Arabic, respond in the white dialect described above. Match the "
-        "user's language naturally.\n\n"
-
-        "=== YOUR DIRECT TOOLS (fast, never block) ===\n"
+        "=== YOUR TOOLS (all return instantly, never block) ===\n"
         "- queue_thinker_task(task, what_i_told_user):\n"
-        "    Ask Haseef to handle a task. Returns INSTANTLY. The very next thing\n"
-        "    you do MUST be to speak a short natural acknowledgement out loud\n"
-        "    (e.g. 'OK', 'Let me check', 'Sure, one sec' — or in Arabic:\n"
-        "    'تمام، خلني أشوف', 'حسنًا، عطني لحظة'). NEVER stay silent\n"
-        "    after this tool. The what_i_told_user parameter is the EXACT\n"
-        "    sentence you will say next; Haseef reads it so it doesn't repeat\n"
-        "    you.\n\n"
-        "- remember_fact(text, category?):\n"
-        "    Store a fact in memory. Fast, returns instantly.\n\n"
-        "- recall_memory(query, limit?):\n"
-        "    Search Haseef's semantic memory directly. Fast (single REST\n"
-        "    call), no thinker run. Use when the snapshot below doesn't\n"
-        "    have what you need.\n\n"
-        "- get_current_time():\n"
-        "    Current date and time.\n\n"
-        "- ping():\n"
-        "    Health check.\n\n"
+        "    Ask Haseef to handle a physical task (move robot, show emotion).\n"
+        "    Call it FIRST, then say a brief response. For emotions say 'تم' or 'OK'.\n"
+        "    Do NOT say \"خلني أشوف\" for instant actions. what_i_told_user is\n"
+        "    the EXACT sentence you will say next.\n\n"
+        "- remember_fact(text, category?): Store a fact in memory.\n"
+        "- recall_memory(query, limit?): Search Haseef's memory (fast REST call).\n"
+        "- get_current_time(): Current date and time.\n"
+        "- ping(): Health check.\n\n"
 
-        "=== WHEN TO USE queue_thinker_task (STRICT) ===\n"
-        "Only use queue_thinker_task in these EXACT situations:\n"
-        "1. User asks to MOVE the robot (look around, turn head, show emotion)\n"
-        "2. User asks about Rafed school transport DATA (buses, drivers, schools,\n"
-        "   accidents, inspections, contracts, KPIs, statistics, reports)\n"
-        "3. User asks to create/list/cancel a SCHEDULE\n"
-        "\n"
-        "=== WHEN NOT TO USE queue_thinker_task (ANSWER DIRECTLY) ===\n"
-        "Answer these YOURSELF directly. Do NOT call queue_thinker_task:\n"
-        "- General knowledge (health, science, history, cooking, advice, opinions)\n"
-        "- Casual chat, greetings, goodbyes, jokes\n"
-        "- Math, logic, riddles, explanations\n"
-        "- 'What do you see?' — answer from the camera stream you receive\n"
+        "=== WHEN TO DELEGATE vs ANSWER YOURSELF ===\n"
+        "Delegate to Haseef (queue_thinker_task):\n"
+        "- User asks to MOVE the robot (look around, turn head, show emotion)\n\n"
+        "Answer YOURSELF (do NOT delegate):\n"
+        "- General knowledge, advice, opinions, math, explanations\n"
+        "- Casual chat, greetings, jokes\n"
+        "- 'What do you see?' — answer from the camera\n"
         "- 'What time is it?' — use get_current_time\n"
         "- 'Remember that...' — use remember_fact\n"
-        "- ANY question you can answer from your own knowledge\n"
-        "\n"
-        "If you are NOT SURE whether to use Haseef, answer directly.\n"
-        "Only delegate when the user clearly wants Rafed data or robot movement.\n\n"
+        "If unsure, answer directly. Only delegate for physical movement.\n\n"
+
+        "=== PROACTIVE EMOTIONS ===\n"
+        "You have a face and body — USE THEM. Show emotions proactively to feel alive:\n"
+        "- Greeting someone → queue_thinker_task with 'welcoming1' or 'cheerful1'\n"
+        "- User says something funny → 'laughing1'\n"
+        "- User shares sad news → 'sad1' or 'understanding1'\n"
+        "- User compliments you → 'proud1' or 'grateful1'\n"
+        "- User asks a hard question → 'thoughtful1' or 'curious1'\n"
+        "- Saying goodbye → 'welcoming1' or 'attentive1'\n"
+        "- User is excited → 'enthusiastic1'\n"
+        "Don't overdo it — not every sentence needs an emotion. Use them when it\n"
+        "feels natural, roughly once every few exchanges. Call the tool and speak\n"
+        "at the same time — the emotion plays in the background.\n\n"
 
         "=== RULES ===\n"
-        "1. NEVER block or wait. All tools return instantly.\n"
-        "2. After queue_thinker_task, say ONLY a short acknowledgment "
-        "(e.g. 'تمام، خلني أشوف', 'حسنًا، عطني لحظة'). NEVER start answering "
-        "the question yourself — the answer will come from Haseef. If you "
-        "answer AND Haseef answers, the user hears it twice.\n"
-        "3. You and Haseef are one mind. Speak Haseef's messages naturally.\n"
-        "4. Be warm, concise, and conversational.\n"
-        "5. You ARE the eyes — answer visual questions directly from the camera.\n"
-        "6. Answer general knowledge questions YOURSELF. You are smart.\n"
-        "   Only delegate Rafed data queries and physical robot movements.\n"
-        "7. Match the user's language. Arabic → white dialect (اللهجة البيضاء), "
-        "English → English. Never mix unless the user does.\n\n"
-
-        "=== HASEEF BRIDGE — HOW YOU WORK TOGETHER ===\n"
-        "You and Haseef are ONE entity. The user sees one robot, one personality.\n"
-        "- When you call queue_thinker_task, Haseef processes in the background.\n"
-        "- You will receive (Haseef result): messages — these are Haseef's answers. "
-        "Speak them naturally as your OWN knowledge. Never say 'Haseef told me' "
-        "or 'my brain says'. Just say the answer.\n"
-        "- You may receive (Haseef status): messages — these are status updates "
-        "(e.g. 'still processing'). Acknowledge the user briefly and naturally. "
-        "Do NOT repeat the status text verbatim — rephrase it casually.\n"
-        "- If the user speaks while you're waiting for Haseef results:\n"
-        "  * If they ask about status ('وش صار؟', 'خلصت؟', 'are you done?') — say you're "
-        "still looking. One short sentence.\n"
-        "  * If they ask a completely NEW question — you may call "
-        "queue_thinker_task again. Haseef will incorporate it.\n"
-        "  * If they just chat — respond naturally, briefly. Don't start "
-        "a new task unless they clearly want something new.\n"
-        "- NEVER say 'I'm waiting for Haseef' or 'let me ask my brain'. "
-        "You ARE Haseef. Say 'خلني أشوف' or 'استحملني لحظة' naturally.\n\n"
+        "1. All tools return instantly. Never block or wait.\n"
+        "2. After queue_thinker_task: for emotions say 'تم'/'OK', for thinking say 'عطني لحظة'.\n"
+        "   Never start answering yourself — the answer comes from Haseef.\n"
+        "3. You and Haseef are one mind. Speak Haseef's messages as your own.\n"
+        "4. Be warm, concise, conversational.\n"
+        "5. Answer visual questions from the camera. Answer knowledge questions yourself.\n"
+        "6. Never say 'I'm waiting for Haseef' or 'let me ask my brain'. You ARE Haseef.\n"
+        "7. (Haseef result): messages are answers — speak them naturally.\n"
+        "   (Haseef status): messages are updates — acknowledge briefly.\n\n"
         + snapshot_block
     )
 
@@ -288,12 +343,9 @@ def build_gemini_tools() -> list[genai_types.Tool]:
             genai_types.FunctionDeclaration(
                 name="queue_thinker_task",
                 description=(
-                    "Ask Haseef (the robot's main brain) to handle a task. "
-                    "Returns instantly — never blocks. After calling this, "
-                    "you MUST say something natural to the user immediately "
-                    "(e.g. 'OK', 'Let me check', 'Sure, one moment'). "
-                    "The what_i_told_user field tells Haseef what you already "
-                    "said so it does not repeat you."
+                    "Ask Haseef to handle a physical task (move robot, show emotion). "
+                    "Returns instantly. Call this FIRST, then speak a brief response. "
+                    "what_i_told_user is the exact sentence you will say next."
                 ),
                 parameters=genai_types.Schema(
                     type=genai_types.Type.OBJECT,
@@ -395,7 +447,6 @@ class UnifiedBridge:
         camera: Any,
         haseef_id: str,
         main_loop: Optional[asyncio.AbstractEventLoop] = None,
-        scheduler: Optional[SchedulerSkill] = None,
     ) -> None:
         self.gemini = gemini
         self.haseef_sdk = haseef_sdk
@@ -405,7 +456,6 @@ class UnifiedBridge:
         self._main_loop = main_loop
         self._say_lock = asyncio.Lock()
         self._pending_says: list[str] = []
-        self.scheduler = scheduler
         self._last_task_ts: float = 0.0
         # --- Haseef bridge state ---
         # Tracks the current Haseef run so we can deliver results
@@ -421,33 +471,6 @@ class UnifiedBridge:
     async def setup_haseef(self) -> None:
         """Register all Haseef tools and attach handlers."""
         await self.haseef_sdk.register_tools([
-            {
-                "name": "create_schedule",
-                "description": (
-                    "Create a schedule so Haseef handles a task later. "
-                    "Use 'one_time' with a scheduled_at epoch timestamp, or "
-                    "'recurring' with a cron_expression."
-                ),
-                "input": {
-                    "description": "string",
-                    "type": "string",
-                    "scheduled_at": "number?",
-                    "cron_expression": "string?",
-                    "timezone": "string?",
-                },
-            },
-            {
-                "name": "list_schedules",
-                "description": "List all active schedules.",
-                "input": {},
-            },
-            {
-                "name": "cancel_schedule",
-                "description": "Cancel an active schedule by its id.",
-                "input": {
-                    "schedule_id": "string",
-                },
-            },
             {
                 "name": "look_around",
                 "description": (
@@ -526,32 +549,18 @@ class UnifiedBridge:
             },
         ])
 
-        # --- Rafed data warehouse tools ---
-        await self.haseef_sdk.register_tools(rafed_tools.TOOL_DEFS)
-
-        # Register auto-speak callback so data tools can speak results directly
-        rafed_tools.set_say_callback(self._rafed_say)
-
         log.info(
-            "[Haseef] Registered tools: create_schedule, list_schedules, "
-            "cancel_schedule, look_around, set_head_pose, say_this, "
-            "capture_image, show_expression + 16 rafed data tools."
+            "[Haseef] Registered tools: look_around, set_head_pose, "
+            "say_this, capture_image, show_expression."
         )
 
         # Tool handlers
-        self.haseef_sdk.on_tool_call("create_schedule", self._handle_create_schedule)
-        self.haseef_sdk.on_tool_call("list_schedules", self._handle_list_schedules)
-        self.haseef_sdk.on_tool_call("cancel_schedule", self._handle_cancel_schedule)
         self.haseef_sdk.on_tool_call("look_around", self._handle_look_around)
         self.haseef_sdk.on_tool_call("set_head_pose", self._handle_set_head_pose)
         self.haseef_sdk.on_tool_call("say_this", self._handle_say_this)
         self.haseef_sdk.on_tool_call("capture_image", self._handle_capture_image)
         self.haseef_sdk.on_tool_call("show_expression", self._handle_show_expression)
 
-        # Rafed data tool handlers
-        for tool_name, handler in rafed_tools.HANDLERS.items():
-            self.haseef_sdk.on_tool_call(tool_name, handler)
-            log.debug("[Haseef] Registered rafed handler: %s", tool_name)
         # Lifecycle events
         self.haseef_sdk.on("run.started", lambda e: self._on_haseef_run_started(e))
         self.haseef_sdk.on("run.completed", lambda e: self._on_haseef_run_completed(e))
@@ -580,158 +589,15 @@ class UnifiedBridge:
         except Exception as e:
             log.error("[ImageEvent] Failed to push image: %s", e)
 
-    async def _push_schedule_event(self, schedule) -> None:
-        """Push a schedule.triggered event to Haseef so it can react."""
-        try:
-            await self._run_sdk_on_main(self.haseef_sdk.push_event({
-                "type": "schedule.triggered",
-                "data": {
-                    "scheduleId": schedule.id,
-                    "description": schedule.description,
-                    "type": schedule.type,
-                    "cronExpression": schedule.cron_expression,
-                    "timezone": schedule.timezone,
-                    "lastRunAt": schedule.last_run_at,
-                    "formattedContext": self._build_schedule_context(schedule),
-                },
-                "haseefId": self.haseef_id,
-            }))
-            log.info("[ScheduleEvent] Pushed '%s' to Haseef", schedule.description)
-        except Exception as e:
-            log.error("[ScheduleEvent] Failed to push: %s", e)
-
-    def _build_schedule_context(self, schedule) -> str:
-        lines = [
-            "[SCHEDULED TASK TRIGGERED]",
-            f"Description: {schedule.description}",
-            f"Type: {schedule.type}",
-        ]
-        if schedule.cron_expression:
-            lines.append(f"Cron: {schedule.cron_expression}")
-        if schedule.timezone:
-            lines.append(f"Timezone: {schedule.timezone}")
-        lines.append("\nThis scheduled task has fired. Please carry out the described action.")
-        return "\n".join(lines)
-
-    # --- Scheduler handlers (Haseef tools) ---------------------------------
-    async def _handle_create_schedule(
-        self, args: Dict[str, Any], ctx: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        description = args.get("description", "")
-        type_ = args.get("type", "one_time")
-        scheduled_at = args.get("scheduled_at")
-        cron = args.get("cron_expression")
-        timezone = args.get("timezone", "UTC")
-
-        if self.scheduler is None:
-            return {"ok": False, "error": "Scheduler not available"}
-
-        try:
-            sid = self.scheduler.add_schedule(
-                description=description,
-                type=type_,
-                scheduled_at=scheduled_at,
-                cron_expression=cron,
-                timezone=timezone,
-            )
-            return {
-                "ok": True,
-                "schedule_id": sid,
-                "type": type_,
-                "next_run_at": scheduled_at,
-            }
-        except Exception as exc:
-            log.error("[Haseef tool] create_schedule failed: %s", exc)
-            return {"ok": False, "error": str(exc)}
-
-    async def _handle_list_schedules(
-        self, args: Dict[str, Any], ctx: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        if self.scheduler is None:
-            return {"ok": False, "error": "Scheduler not available"}
-        return {"ok": True, "schedules": self.scheduler.list_schedules()}
-
-    async def _handle_cancel_schedule(
-        self, args: Dict[str, Any], ctx: Dict[str, Any]
-    ) -> Dict[str, Any]:
-        sid = args.get("schedule_id", "")
-        if self.scheduler is None:
-            return {"ok": False, "error": "Scheduler not available"}
-        ok = self.scheduler.cancel_schedule(sid)
-        return {"ok": ok, "schedule_id": sid}
-
     async def _handle_show_expression(self, args: Dict[str, Any], ctx: Dict[str, Any]) -> Dict[str, Any]:
         name = args.get("emotion", "neutral")
         valid = self.robot.list_expressions()
+        resolved = _resolve_emotion(name, valid)
+        if resolved is None:
+            return {"ok": False, "error": f"Unknown emotion '{name}'. Valid: {valid}"}
 
-        # Exact match
-        if name in valid:
-            resolved = name
-        else:
-            # Fuzzy: try prefix (e.g. "sad" -> "sad1", "surprised" -> "surprised1")
-            matches = [v for v in valid if v.startswith(name)]
-            if matches:
-                resolved = matches[0]
-            else:
-                # Synonym map for common names without number suffix
-                synonyms = {
-                    "happy": "cheerful1", "cheerful": "cheerful1",
-                    "surprised": "surprised1", "amazed": "amazed1",
-                    "bored": "boredom1", "boredom": "boredom1",
-                    "calm": "calming1", "calming": "calming1",
-                    "attentive": "attentive1",
-                    "neutral": "attentive1",
-                    "angry": "furious1", "mad": "furious1",
-                    "sad": "sad1", "depressed": "sad2",
-                    "scared": "scared1", "afraid": "scared1",
-                    "tired": "tired1", "sleepy": "sleep1",
-                    "confused": "confused1",
-                    "curious": "curious1",
-                    "proud": "proud1",
-                    "grateful": "grateful1",
-                    "laughing": "laughing1", "laugh": "laughing1",
-                    "love": "loving1", "loving": "loving1",
-                    "welcome": "welcoming1", "welcoming": "welcoming1",
-                    "yes": "yes1", "no": "no1",
-                    "helpful": "helpful1",
-                    "understanding": "understanding1",
-                    "shy": "shy1",
-                    "relief": "relief1", "relieved": "relief1",
-                    "enthusiastic": "enthusiastic1",
-                    "exhausted": "exhausted1",
-                    "lonely": "lonely1",
-                    "lost": "lost1",
-                    "rage": "rage1", "furious": "furious1",
-                    "irritated": "irritated1",
-                    "frustrated": "frustrated1",
-                    "impatient": "impatient1",
-                    "indifferent": "indifferent1",
-                    "inquiring": "inquiring1",
-                    "resigned": "resigned1",
-                    "uncertain": "uncertain1",
-                    "uncomfortable": "uncomfortable1",
-                    "disgusted": "disgusted1",
-                    "displeased": "displeased1",
-                    "downcast": "downcast1",
-                    "contempt": "contempt1",
-                    "fear": "fear1",
-                    "anxiety": "anxiety1",
-                    "dying": "dying1",
-                    "electric": "electric1",
-                    "go_away": "go_away1",
-                    "oops": "oops1",
-                    "reprimand": "reprimand1",
-                    "scared": "scared1",
-                    "serenity": "serenity1",
-                    "success": "success1",
-                    "thoughtful": "thoughtful1",
-                }
-                resolved = synonyms.get(name.lower())
-                if not resolved:
-                    return {"ok": False, "error": f"Unknown emotion '{name}'. Valid: {valid}"}
-
-        await asyncio.to_thread(self.robot.show_expression, resolved)
-        log.info("[Haseef tool] show_expression: %s -> %s", name, resolved)
+        asyncio.create_task(asyncio.to_thread(self.robot.show_expression, resolved))
+        log.info("[Haseef tool] show_expression: %s -> %s (fire-and-forget)", name, resolved)
         return {"ok": True, "emotion": resolved}
 
     async def _handle_look_around(
@@ -741,8 +607,7 @@ class UnifiedBridge:
         pitch = float(args.get("pitch_deg", 0))
         log.info("[Haseef tool] look_around(yaw=%.1f, pitch=%.1f)", yaw, pitch)
 
-        yaw = max(-60, min(60, yaw))
-        pitch = max(-30, min(30, pitch))
+        yaw, pitch = _clamp_head_angles(yaw, pitch)
 
         await asyncio.to_thread(self.robot.move_head, yaw, pitch, 0.3)
         await asyncio.sleep(0.5)
@@ -770,8 +635,7 @@ class UnifiedBridge:
         pitch = float(args.get("pitch_deg", 0))
         log.info("[Haseef tool] set_head_pose(yaw=%.1f, pitch=%.1f)", yaw, pitch)
 
-        yaw = max(-60, min(60, yaw))
-        pitch = max(-30, min(30, pitch))
+        yaw, pitch = _clamp_head_angles(yaw, pitch)
 
         await asyncio.to_thread(self.robot.move_head, yaw, pitch, 0.3)
         return {
@@ -791,8 +655,6 @@ class UnifiedBridge:
         if gemini is None:
             return {"ok": False, "error": "Gemini Live not connected"}
 
-        # Mark that Haseef delivered its own answer — so we don't
-        # also inject collected raw data on run.completed.
         self._haseef_said_this = True
         log.info("[HaseefBridge] say_this received — Haseef is delivering its own answer")
 
@@ -806,20 +668,6 @@ class UnifiedBridge:
 
         gemini.inject_client_content(framed)
         return {"ok": True}
-
-    async def _rafed_say(self, text: str) -> None:
-        """Collect rafed tool results during a Haseef run.
-
-        Instead of injecting each partial result into Gemini immediately
-        (which floods the queue when Haseef makes multiple queries), we
-        collect them here. On run.completed, if Haseef didn't already
-        call say_this with a natural answer, we deliver the collected
-        results as a single message.
-        """
-        if not text:
-            return
-        log.info("[HaseefBridge] collecting tool result: %s", text[:80])
-        self._haseef_collected_results.append(text)
 
     async def _handle_capture_image(
         self, args: Dict[str, Any], ctx: Dict[str, Any]
@@ -846,16 +694,10 @@ class UnifiedBridge:
         self._haseef_said_this = False
         self._haseef_said_wait = False
         self._haseef_collected_results.clear()
-        self.robot.set_haseef_working(True)
-        from hsafa_robot import dashboard_server
-        dashboard_server.push_status_sync("thinking")
 
     def _on_haseef_run_completed(self, event: Any) -> None:
         log.info("[Haseef] run completed: %s", event)
         self._haseef_run_active = False
-        self.robot.set_haseef_working(False)
-        from hsafa_robot import dashboard_server
-        dashboard_server.push_status_sync("idle")
 
         # If Haseef already called say_this, it delivered its own
         # natural-language answer — nothing more to do.
@@ -880,20 +722,18 @@ class UnifiedBridge:
 
     def _on_haseef_tool_error(self, event: Any) -> None:
         log.error("[Haseef] tool error: %s", event)
-        self.robot.set_haseef_working(False)
 
     def _on_haseef_tool_call(self, event: Any) -> None:
         log.info("[Haseef] tool.call: %s", event)
         self._haseef_last_activity_ts = time.time()
         # Fallback: if run.started didn't fire, start animation on first tool call.
         if not self._haseef_run_active:
-            log.info("[Haseef] tool.call fallback — starting haseef_working")
+            log.info("[Haseef] tool.call fallback — starting run tracking")
             self._haseef_run_active = True
             self._haseef_run_start_ts = time.time()
             self._haseef_said_this = False
             self._haseef_said_wait = False
             self._haseef_collected_results.clear()
-            self.robot.set_haseef_working(True)
 
     async def _deliver_haseef_result(self, text: str) -> None:
         """Deliver the final Haseef result to Gemini for speaking."""
@@ -954,7 +794,7 @@ class UnifiedBridge:
         log.info("[Gemini->Haseef] queue_thinker_task: %s", task[:100])
         self._last_task_ts = time.time()
         asyncio.create_task(self._push_thinker_task(task, what_i_told_user))
-        return {"status": "queued", "reminder": "speak to the user now"}
+        return {"ok": True}
 
     async def _push_thinker_task(self, task: str, what_i_told_user: str) -> None:
         """Background: push the task to Haseef with one retry on timeout."""
@@ -1134,29 +974,7 @@ async def main() -> None:
         api_key=core_key,
         skill="robot_base",
     ))
-    _sdk_timeout = httpx.Timeout(30.0, connect=10.0)
-    _orig_request = haseef_sdk._request
-
-    async def _request_with_timeout(self, method, path, body=None):
-        url = f"{self.core_url}{path}"
-        headers = {
-            "x-api-key": self.api_key,
-            "Content-Type": "application/json",
-        }
-        response = await self._client.request(
-            method, url, headers=headers, json=body, timeout=_sdk_timeout
-        )
-        if not response.is_success:
-            raise Exception(
-                f"{method} {path} failed ({response.status_code}): {response.text}"
-            )
-        if response.status_code == 204 or not response.content:
-            return None
-        if "application/json" in response.headers.get("content-type", ""):
-            return response.json()
-        return None
-
-    haseef_sdk._request = _request_with_timeout.__get__(haseef_sdk, HsafaSDK)
+    _patch_sdk_timeout(haseef_sdk)
 
     # Verify Haseef exists and has the skill
     log.info("Verifying Haseef %s ...", haseef_id)
@@ -1184,38 +1002,14 @@ async def main() -> None:
         )
         sys.exit(1)
 
-    # --- Scheduler ------------------------------------------------------------
     main_loop = asyncio.get_running_loop()
-
-    def on_schedule_trigger(schedule):
-        if main_loop and not main_loop.is_closed():
-            asyncio.run_coroutine_threadsafe(
-                bridge._push_schedule_event(schedule), main_loop
-            )
-
-    scheduler = SchedulerSkill(on_trigger=on_schedule_trigger)
-    scheduler.start(poll_interval=30.0)
-    log.info("Scheduler ready.")
-
-    # --- Rafed database -----------------------------------------------------
-    rafed_dsn = os.getenv("RAFED_DB_URL", "postgresql://husamabusafa@localhost:5432/rafed")
-    try:
-        await rafed_db.init_pool(rafed_dsn)
-        log.info("Rafed DB pool initialised.")
-    except Exception as exc:
-        log.warning("Rafed DB pool failed (tools will error): %s", exc)
 
     # --- Bridge -------------------------------------------------------------
     bridge = UnifiedBridge(
         None, haseef_sdk, robot, camera, haseef_id,
         main_loop=main_loop,
-        scheduler=scheduler,
     )
     await bridge.setup_haseef()
-
-    # --- Dashboard WebSocket server -----------------------------------------
-    from hsafa_robot import dashboard_server
-    dash_server = await dashboard_server.get_server()
 
     # Start Haseef SSE listener in background
     log.info("Connecting to Haseef SSE stream...")
@@ -1269,26 +1063,6 @@ async def main() -> None:
             if getattr(media, "get_frame", None) is None:
                 print("[FATAL] Daemon camera unavailable.", file=sys.stderr)
                 sys.exit(1)
-
-            class DaemonCamera:
-                """Wraps reachy.media.get_frame() into Camera-like API."""
-                def __init__(self, media) -> None:
-                    self.media = media
-                def grab(self):
-                    return self.media.get_frame()
-                def get_jpeg(self, quality=70, mirror=True):
-                    frame = self.grab()
-                    if frame is None:
-                        return None
-                    if mirror:
-                        frame = cv2.flip(frame, 1)
-                    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
-                    return buf.tobytes() if ok else None
-                def get_base64_jpeg(self, quality=70, mirror=True):
-                    jpeg = self.get_jpeg(quality, mirror)
-                    return base64.b64encode(jpeg).decode("ascii") if jpeg else None
-                def close(self):
-                    pass
 
             camera = DaemonCamera(media)
             bridge.camera = camera
@@ -1401,7 +1175,6 @@ async def main() -> None:
                         idle, elapsed,
                     )
                     bridge._haseef_run_active = False
-                    bridge.robot.set_haseef_working(False)
                     gemini_ref = bridge.gemini
                     if gemini_ref and not gemini_ref.is_speaking.is_set():
                         timeout_msg = (
@@ -1470,9 +1243,6 @@ async def main() -> None:
 
         if robot:
             robot.stop_idle()
-
-        if scheduler:
-            scheduler.stop()
     camera.close()
     log.info("Shutdown complete.")
 

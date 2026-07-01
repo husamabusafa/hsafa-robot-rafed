@@ -6,12 +6,14 @@ Exports:
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import math
+import random
 import threading
 import time
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -33,6 +35,225 @@ _TRACK_RECENTER_AFTER_S = 3.0
 _TRACK_RECENTER_DECAY = 0.97
 
 log = logging.getLogger("robot_controller")
+
+
+# ---------------------------------------------------------------------------
+# Speaking gesture factories
+# ---------------------------------------------------------------------------
+# Each factory returns (duration_s, offsets_fn) where offsets_fn(t, amp)
+# returns (z_mm, pitch_deg, yaw_deg, roll_deg, ant_r, ant_l).
+#
+# Amplitudes are strong and slow (user-approved from live robot testing).
+# amp scales motion with audio volume (floor 0.5 so it's always visible).
+# A half-sine envelope fades each gesture in/out so switching never snaps.
+
+def _env(t: float, dur: float) -> float:
+    """Half-sine envelope: 0 -> 1 -> 0 over [0, dur]."""
+    return math.sin(math.pi * t / dur)
+
+
+def _make_gentle_bob() -> Tuple[float, Callable]:
+    dur = random.uniform(3.0, 5.0)
+    freq = random.uniform(1.2, 1.8)
+
+    def fn(t: float, amp: float) -> tuple:
+        e = _env(t, dur)
+        phase = 2 * math.pi * t * freq
+        z = amp * 5.0 * math.sin(phase)
+        pitch = amp * 3.5 * math.sin(phase + 0.4)
+        roll = amp * 1.5 * math.sin(2 * math.pi * t / 11.0)
+        ap = 2 * math.pi * t * 1.2
+        ant_r = (0.10 + 0.35 * amp) * math.sin(ap)
+        ant_l = (0.10 + 0.35 * amp) * math.sin(ap + math.pi * 0.7)
+        return z, pitch, 0.0, roll, ant_r, ant_l
+
+    return dur, fn
+
+
+def _make_nodding() -> Tuple[float, Callable]:
+    dur = random.uniform(3.0, 5.0)
+    freq = random.uniform(0.6, 0.9)
+
+    def fn(t: float, amp: float) -> tuple:
+        e = _env(t, dur)
+        pitch = amp * 6.0 * e * math.sin(2 * math.pi * freq * t)
+        z = amp * 3.0 * e * math.sin(2 * math.pi * freq * t)
+        roll = amp * 1.0 * math.sin(2 * math.pi * t / 10.0)
+        ant_r = (0.10 + 0.30 * amp) * e * math.sin(2 * math.pi * 0.9 * t)
+        ant_l = (0.10 + 0.30 * amp) * e * math.sin(2 * math.pi * 0.9 * t + math.pi * 0.7)
+        return z, pitch, 0.0, roll, ant_r, ant_l
+
+    return dur, fn
+
+
+def _make_head_tilt() -> Tuple[float, Callable]:
+    dur = random.uniform(3.5, 5.5)
+    side = random.choice((-1.0, 1.0))
+
+    def fn(t: float, amp: float) -> tuple:
+        e = _env(t, dur)
+        roll = side * amp * 7.0 * e
+        z = amp * 2.5 * math.sin(2 * math.pi * t * 1.2)
+        pitch = amp * 1.5 * math.sin(2 * math.pi * t * 1.2 + 0.4)
+        ant_r = (0.10 + 0.30 * amp) * e * math.sin(2 * math.pi * 0.8 * t)
+        ant_l = (0.10 + 0.30 * amp) * e * math.sin(2 * math.pi * 0.8 * t + math.pi * 0.7)
+        return z, pitch, 0.0, roll, ant_r, ant_l
+
+    return dur, fn
+
+
+def _make_side_sway() -> Tuple[float, Callable]:
+    dur = random.uniform(3.5, 5.5)
+    freq = random.uniform(0.20, 0.30)
+
+    def fn(t: float, amp: float) -> tuple:
+        e = _env(t, dur)
+        yaw = amp * 8.0 * e * math.sin(2 * math.pi * freq * t)
+        z = amp * 3.0 * math.sin(2 * math.pi * t * 1.5)
+        roll = amp * 1.2 * math.sin(2 * math.pi * t / 9.0)
+        ant_r = (0.10 + 0.30 * amp) * e * math.sin(2 * math.pi * 0.8 * t)
+        ant_l = (0.10 + 0.30 * amp) * e * math.sin(2 * math.pi * 0.8 * t + math.pi * 0.7)
+        return z, 0.0, yaw, roll, ant_r, ant_l
+
+    return dur, fn
+
+
+def _make_thoughtful() -> Tuple[float, Callable]:
+    dur = random.uniform(3.0, 5.0)
+
+    def fn(t: float, amp: float) -> tuple:
+        e = _env(t, dur)
+        pitch = -amp * 4.0 * e
+        z = amp * 2.0 * math.sin(2 * math.pi * t * 0.8)
+        roll = amp * 1.0 * math.sin(2 * math.pi * t / 12.0)
+        ant_r = (0.10 + 0.20 * amp) * e * math.sin(2 * math.pi * 0.5 * t)
+        ant_l = (0.10 + 0.20 * amp) * e * math.sin(2 * math.pi * 0.5 * t + math.pi * 0.7)
+        return z, pitch, 0.0, roll, ant_r, ant_l
+
+    return dur, fn
+
+
+def _make_quick_nods() -> Tuple[float, Callable]:
+    dur = random.uniform(2.5, 4.0)
+    freq = random.uniform(0.8, 1.2)
+
+    def fn(t: float, amp: float) -> tuple:
+        e = _env(t, dur)
+        pitch = amp * 5.0 * e * math.sin(2 * math.pi * freq * t)
+        z = amp * 3.0 * e * math.sin(2 * math.pi * freq * t)
+        roll = amp * 1.5 * e * math.sin(2 * math.pi * t / 7.0)
+        ant_r = (0.10 + 0.40 * amp) * e * math.sin(2 * math.pi * 1.2 * t)
+        ant_l = (0.10 + 0.40 * amp) * e * math.sin(2 * math.pi * 1.2 * t + math.pi * 0.7)
+        return z, pitch, 0.0, roll, ant_r, ant_l
+
+    return dur, fn
+
+
+def _make_bob_and_sway() -> Tuple[float, Callable]:
+    dur = random.uniform(3.5, 5.5)
+    freq = random.uniform(1.2, 1.8)
+    sway_freq = random.uniform(0.18, 0.25)
+
+    def fn(t: float, amp: float) -> tuple:
+        e = _env(t, dur)
+        phase = 2 * math.pi * t * freq
+        z = amp * 5.0 * e * math.sin(phase)
+        pitch = amp * 3.0 * e * math.sin(phase + 0.4)
+        yaw = amp * 6.0 * e * math.sin(2 * math.pi * sway_freq * t)
+        roll = amp * 1.5 * e * math.sin(2 * math.pi * t / 9.0)
+        ap = 2 * math.pi * t * 1.2
+        ant_r = (0.10 + 0.35 * amp) * e * math.sin(ap)
+        ant_l = (0.10 + 0.35 * amp) * e * math.sin(ap + math.pi * 0.7)
+        return z, pitch, yaw, roll, ant_r, ant_l
+
+    return dur, fn
+
+
+def _make_wobble() -> Tuple[float, Callable]:
+    dur = random.uniform(3.0, 5.0)
+    freq = random.uniform(0.5, 0.7)
+
+    def fn(t: float, amp: float) -> tuple:
+        e = _env(t, dur)
+        roll = amp * 7.0 * e * math.sin(2 * math.pi * freq * t)
+        z = amp * 3.5 * math.sin(2 * math.pi * t * 1.5)
+        pitch = amp * 2.0 * math.sin(2 * math.pi * t * 1.5 + 0.4)
+        ant_r = (0.10 + 0.40 * amp) * e * math.sin(2 * math.pi * 0.9 * t)
+        ant_l = (0.10 + 0.40 * amp) * e * math.sin(2 * math.pi * 0.9 * t + math.pi * 0.7)
+        return z, pitch, 0.0, roll, ant_r, ant_l
+
+    return dur, fn
+
+
+def _make_big_tilt() -> Tuple[float, Callable]:
+    """Extra: big slow tilt to one side and hold — emotional leaning."""
+    dur = random.uniform(3.0, 4.5)
+    side = random.choice((-1.0, 1.0))
+    amp_roll = random.uniform(7.0, 10.0)
+
+    def fn(t: float, amp: float) -> tuple:
+        e = _env(t, dur)
+        roll = side * amp * amp_roll * e
+        z = amp * 2.0 * math.sin(2 * math.pi * t * 1.0)
+        pitch = amp * 1.0 * math.sin(2 * math.pi * t * 1.0 + 0.4)
+        ant_r = (0.10 + 0.30 * amp) * e * math.sin(2 * math.pi * 0.7 * t)
+        ant_l = (0.10 + 0.30 * amp) * e * math.sin(2 * math.pi * 0.7 * t + math.pi * 0.7)
+        return z, pitch, 0.0, roll, ant_r, ant_l
+
+    return dur, fn
+
+
+def _make_tilt_and_nod() -> Tuple[float, Callable]:
+    """Extra: combined tilt + nod — expressive and characterful."""
+    dur = random.uniform(3.5, 5.0)
+    side = random.choice((-1.0, 1.0))
+    tilt_freq = random.uniform(0.4, 0.6)
+    nod_freq = random.uniform(0.8, 1.2)
+
+    def fn(t: float, amp: float) -> tuple:
+        e = _env(t, dur)
+        roll = side * amp * 5.0 * e * math.sin(2 * math.pi * tilt_freq * t)
+        pitch = amp * 3.0 * e * math.sin(2 * math.pi * nod_freq * t)
+        z = amp * 2.0 * math.sin(2 * math.pi * t * 1.0)
+        ant_r = (0.10 + 0.35 * amp) * e * math.sin(2 * math.pi * 0.9 * t)
+        ant_l = (0.10 + 0.35 * amp) * e * math.sin(2 * math.pi * 0.9 * t + math.pi * 0.7)
+        return z, pitch, 0.0, roll, ant_r, ant_l
+
+    return dur, fn
+
+
+_SPEAKING_GESTURES: List[Callable] = [
+    _make_gentle_bob,
+    _make_nodding,
+    _make_head_tilt,
+    _make_side_sway,
+    _make_thoughtful,
+    _make_quick_nods,
+    _make_bob_and_sway,
+    _make_wobble,
+    _make_big_tilt,
+    _make_tilt_and_nod,
+]
+
+
+# ---------------------------------------------------------------------------
+# Idle emotion clips — played randomly when not speaking
+# ---------------------------------------------------------------------------
+# These are recorded Reachy Mini emotion animations (motion + sound).
+# Played every ~7s during idle. show_expression handles smooth transitions
+# (initial_goto_duration + _smooth_return_to_tracking).
+
+_IDLE_EMOTIONS = [
+    "boredom1", "boredom2", "tired1", "exhausted1", "sleep1",
+    "curious1", "attentive1", "attentive2",
+    "thoughtful1", "thoughtful2", "inquiring1", "inquiring2",
+    "lonely1", "lost1", "downcast1", "resigned1",
+    "cheerful1", "enthusiastic1", "enthusiastic2",
+    "impatient1", "impatient2", "indifferent1",
+    "uncertain1", "shy1", "serenity1", "calming1",
+    "understanding1", "understanding2", "helpful1",
+    "proud1", "proud2", "relief1",
+]
 
 # ---------------------------------------------------------------------------
 # Camera
@@ -110,7 +331,7 @@ class Camera:
 class RobotController:
     """Minimal wrapper around ReachyMini.
 
-    Priority (highest first): expression > speaking > haseef_working > idle
+    Priority (highest first): expression > speaking > idle
     """
 
     def __init__(self, reachy, tracker=None, camera=None) -> None:
@@ -124,12 +345,6 @@ class RobotController:
         self._speech_amp = 0.0
         self._stop_idle = threading.Event()
         self._idle_thread: Optional[threading.Thread] = None
-        # Haseef working state — when set, antennas do a radar-sweep
-        # rotation to signal the robot is "thinking".
-        self._haseef_working = threading.Event()
-        self._haseef_working_since: float = 0.0
-        # Safety: auto-clear after this many seconds to avoid stuck animation.
-        self._haseef_working_timeout_s: float = 120.0
         # Face tracking
         self._tracker = tracker
         self._camera = camera
@@ -181,21 +396,48 @@ class RobotController:
         except Exception as e:
             log.error("notify_audio failed: %s", e)
 
-    # ---- haseef working state ---------------------------------------------
-    def set_haseef_working(self, active: bool) -> None:
-        """Signal that Haseef is actively working (thinking/processing).
+    # ---- face tracking -----------------------------------------------------
+    def _track_face(self) -> tuple:
+        """Run one tick of face tracking. Updates _track_yaw/_track_pitch
+        and returns (face_yaw, face_pitch) in radians, or (None, None)
+        if no face is currently detected."""
+        face_yaw = None
+        face_pitch = None
 
-        When active, the idle loop plays a radar-sweep antenna rotation
-        so the robot visibly shows it's busy. When cleared, antennas
-        return to normal idle/speaking behaviour.
-        """
-        if active:
-            self._haseef_working_since = time.time()
-            self._haseef_working.set()
-            log.info("[Animation] haseef_working ON")
+        if self._tracker is not None and (self._frame_source is not None or self._camera is not None):
+            frame = self._frame_source() if self._frame_source is not None else self._camera.grab()
+            if frame is not None:
+                self._tracker.submit(frame)
+            det = self._tracker.get()
+            now_ts = time.time()
+            if det is not None and (now_ts - det.timestamp) < _TRACK_COAST_S:
+                ex = det.err_x
+                ey = det.err_y
+                self._track_smooth_ex += 0.5 * (ex - self._track_smooth_ex)
+                self._track_smooth_ey += 0.5 * (ey - self._track_smooth_ey)
+                sx = self._track_smooth_ex
+                sy = self._track_smooth_ey
+                if abs(sx) > _TRACK_DEADZONE:
+                    face_yaw = self._track_yaw + _YAW_SIGN * sx * _HALF_HFOV * _TRACK_LEAD_GAIN
+                if abs(sy) > _TRACK_DEADZONE:
+                    face_pitch = self._track_pitch + _PITCH_SIGN * sy * _HALF_VFOV * _TRACK_LEAD_GAIN
+                self._track_last_seen = now_ts
+
+        if face_yaw is not None:
+            face_yaw = max(-_YAW_LIMIT, min(_YAW_LIMIT, face_yaw))
+            self._track_yaw += _TRACK_ALPHA * (face_yaw - self._track_yaw)
         else:
-            self._haseef_working.clear()
-            log.info("[Animation] haseef_working OFF")
+            if (time.time() - self._track_last_seen) > _TRACK_RECENTER_AFTER_S:
+                self._track_yaw *= _TRACK_RECENTER_DECAY
+
+        if face_pitch is not None:
+            face_pitch = max(-_PITCH_LIMIT, min(_PITCH_LIMIT, face_pitch))
+            self._track_pitch += _TRACK_ALPHA * (face_pitch - self._track_pitch)
+        else:
+            if (time.time() - self._track_last_seen) > _TRACK_RECENTER_AFTER_S:
+                self._track_pitch *= _TRACK_RECENTER_DECAY
+
+        return face_yaw, face_pitch
 
     # ---- idle / animation loop ---------------------------------------------
     def start_idle(self) -> None:
@@ -220,24 +462,24 @@ class RobotController:
             log.error("[Animation] idle loop crashed: %s", e, exc_info=True)
 
     def _idle_loop(self) -> None:
-        """Continuous loop: idle sway, audio-reactive speaking, or sleep during expression."""
-        import random
-        import time
+        """Continuous loop: idle sway or audio-reactive speaking.
 
+        Face tracking runs in both states. Expression clips take full
+        priority via _expression_active — the loop just sleeps while
+        a clip plays.
+        """
         from reachy_mini.utils import create_head_pose
 
         t0 = time.time()
 
-        # Idle drift state: smoothly interpolate toward a target yaw that
-        # changes every few seconds. No pitch breathing.
-        next_drift = 0.0
-        yaw_off = 0.0
-        target_yaw = 0.0
+        # Speaking gesture cycling state
+        gesture_start = time.time()
+        gesture_dur = 0.0
+        gesture_fn: Optional[Callable] = None
 
-        # Speaking emphasis state
-        next_emphasis = 0.0
-        emphasis_yaw = 0.0
-        emphasis_decay = 0.0
+        # Idle emotion clip timer — play a random emotion every ~7s
+        last_emotion_clip = time.time()
+        next_emotion_delay = random.uniform(5.0, 10.0)
 
         while not self._stop_idle.is_set():
             # Expression has full control — just sleep.
@@ -245,208 +487,85 @@ class RobotController:
                 time.sleep(0.05)
                 continue
 
-            # Safety: auto-clear haseef_working if it's been on too long
-            # (protects against a missing run.completed event).
-            if self._haseef_working.is_set():
-                elapsed = time.time() - self._haseef_working_since
-                if elapsed > self._haseef_working_timeout_s:
-                    log.warning(
-                        "[Animation] haseef_working auto-cleared after %.0fs (no run.completed)",
-                        elapsed,
-                    )
-                    self._haseef_working.clear()
-
-            # Speaking is driven directly by the bound event
-            # (gemini.is_speaking). No timers, no jitter.
-            # Priority: speaking > haseef_working so the robot looks alive
-            # when Gemini talks, even if Haseef is still processing.
             speaking = (
                 self._speaking_event is not None
                 and self._speaking_event.is_set()
             )
             if not speaking:
-                # Bleed amplitude so the next speaking turn starts fresh.
                 self._speech_amp *= 0.85
-                emphasis_decay = 0.0
+                gesture_dur = 0.0  # force fresh gesture on next speak
 
             t = time.time() - t0
 
-            # Face tracking state — shared across speaking and idle branches.
-            face_yaw = None
-            face_pitch = None
+            # Face tracking — shared between speaking and idle.
+            face_yaw_ret, face_pitch_ret = self._track_face()
+            has_face = face_yaw_ret is not None
 
-            # Haseef working AND not speaking — radar-sweep antennas + face tracking.
-            if self._haseef_working.is_set() and not speaking:
-                # Face tracking — same logic as idle branch
-                if self._tracker is not None and (self._frame_source is not None or self._camera is not None):
-                    frame = self._frame_source() if self._frame_source is not None else self._camera.grab()
-                    if frame is not None:
-                        self._tracker.submit(frame)
-                    det = self._tracker.get()
-                    now_ts = time.time()
-                    if det is not None and (now_ts - det.timestamp) < _TRACK_COAST_S:
-                        ex = det.err_x
-                        ey = det.err_y
-                        self._track_smooth_ex += 0.5 * (ex - self._track_smooth_ex)
-                        self._track_smooth_ey += 0.5 * (ey - self._track_smooth_ey)
-                        sx = self._track_smooth_ex
-                        sy = self._track_smooth_ey
-                        if abs(sx) > _TRACK_DEADZONE:
-                            face_yaw = self._track_yaw + _YAW_SIGN * sx * _HALF_HFOV * _TRACK_LEAD_GAIN
-                        if abs(sy) > _TRACK_DEADZONE:
-                            face_pitch = self._track_pitch + _PITCH_SIGN * sy * _HALF_VFOV * _TRACK_LEAD_GAIN
-                        self._track_last_seen = now_ts
-
-                if face_yaw is not None:
-                    face_yaw = max(-_YAW_LIMIT, min(_YAW_LIMIT, face_yaw))
-                    self._track_yaw += _TRACK_ALPHA * (face_yaw - self._track_yaw)
-                else:
-                    if (time.time() - self._track_last_seen) > _TRACK_RECENTER_AFTER_S:
-                        self._track_yaw *= _TRACK_RECENTER_DECAY
-
-                if face_pitch is not None:
-                    face_pitch = max(-_PITCH_LIMIT, min(_PITCH_LIMIT, face_pitch))
-                    self._track_pitch += _TRACK_ALPHA * (face_pitch - self._track_pitch)
-                else:
-                    if (time.time() - self._track_last_seen) > _TRACK_RECENTER_AFTER_S:
-                        self._track_pitch *= _TRACK_RECENTER_DECAY
-
-                # Head follows face (or stays neutral if no face)
-                roll = 0.5 * math.sin(2 * math.pi * t / 9.0)
-                pose = create_head_pose(
-                    roll=roll,
-                    pitch=math.degrees(self._track_pitch),
-                    yaw=math.degrees(self._track_yaw),
-                    degrees=True,
-                    mm=True,
-                )
-                self._send_head_pose(pose)
-
-                # Radar-sweep antennas: rotate side to side
-                sweep = math.sin(2 * math.pi * t * 0.8)
-                ant_amp = math.radians(25.0)
-                ant_r = ant_amp * sweep
-                ant_l = -ant_amp * sweep
-                self._send_antennas([ant_r, ant_l])
-                time.sleep(0.02)
-                continue
+            has_tracker = (
+                self._tracker is not None
+                and (self._frame_source is not None or self._camera is not None)
+            )
 
             if speaking:
-                amp = self._speech_amp
-                # Floor: keep a minimum bob so the animation never looks frozen.
-                amp = max(amp, 0.20)
+                amp = max(self._speech_amp, 0.50)
 
-                # --- Keep tracking the face even while speaking ---
-                # The head stays pointed at the person (track_yaw/track_pitch)
-                # and we add a subtle bob on top so it looks alive.
-                if self._tracker is not None and (self._frame_source is not None or self._camera is not None):
-                    frame = self._frame_source() if self._frame_source is not None else self._camera.grab()
-                    if frame is not None:
-                        self._tracker.submit(frame)
-                    det = self._tracker.get()
-                    now_ts = time.time()
-                    if det is not None and (now_ts - det.timestamp) < _TRACK_COAST_S:
-                        ex = det.err_x
-                        ey = det.err_y
-                        self._track_smooth_ex += 0.5 * (ex - self._track_smooth_ex)
-                        self._track_smooth_ey += 0.5 * (ey - self._track_smooth_ey)
-                        sx = self._track_smooth_ex
-                        sy = self._track_smooth_ey
-                        if abs(sx) > _TRACK_DEADZONE:
-                            face_yaw = self._track_yaw + _YAW_SIGN * sx * _HALF_HFOV * _TRACK_LEAD_GAIN
-                        if abs(sy) > _TRACK_DEADZONE:
-                            face_pitch = self._track_pitch + _PITCH_SIGN * sy * _HALF_VFOV * _TRACK_LEAD_GAIN
-                        self._track_last_seen = now_ts
+                # Gesture cycling: pick a new random gesture when the
+                # current one expires. Each gesture fades in/out via a
+                # half-sine envelope so switching is seamless.
+                now_rt = time.time()
+                gt = now_rt - gesture_start
+                if gt >= gesture_dur or gesture_fn is None:
+                    gesture_start = now_rt
+                    gesture_dur, gesture_fn = random.choice(_SPEAKING_GESTURES)()
+                    gt = 0.0
 
-                if face_yaw is not None:
-                    face_yaw = max(-_YAW_LIMIT, min(_YAW_LIMIT, face_yaw))
-                    self._track_yaw += _TRACK_ALPHA * (face_yaw - self._track_yaw)
-                if face_pitch is not None:
-                    face_pitch = max(-_PITCH_LIMIT, min(_PITCH_LIMIT, face_pitch))
-                    self._track_pitch += _TRACK_ALPHA * (face_pitch - self._track_pitch)
+                gz, gpitch, gyaw, groll, gant_r, gant_l = gesture_fn(gt, amp)
 
-                # Subtle speech bob — added ON TOP of face-tracking yaw/pitch
-                phase = 2 * math.pi * t * 2.8
-                bob_z = amp * 2.0 * math.sin(phase)
-                bob_pitch = amp * 1.2 * math.sin(phase + 0.4)
-                drift_roll = 0.6 * math.sin(2 * math.pi * t / 9.0)
-
-                # Occasional small emphasis tilt
-                if t > next_emphasis and amp > 0.15:
-                    emphasis_yaw = random.uniform(-3.0, 3.0)
-                    emphasis_decay = 1.0
-                    next_emphasis = t + random.uniform(3.5, 7.0)
-                if emphasis_decay > 0.01:
-                    emphasis_decay *= 0.96
-
-                if self._tracker is not None and (self._frame_source is not None or self._camera is not None):
-                    # Face-tracking + speaking: head follows face, subtle bob
+                if has_tracker:
                     pose = create_head_pose(
-                        z=bob_z,
-                        pitch=math.degrees(self._track_pitch) + bob_pitch,
-                        yaw=math.degrees(self._track_yaw) + emphasis_yaw * emphasis_decay,
-                        roll=drift_roll,
+                        z=gz,
+                        pitch=math.degrees(self._track_pitch) + gpitch,
+                        yaw=math.degrees(self._track_yaw) + gyaw,
+                        roll=groll,
                         degrees=True,
                         mm=True,
                     )
                 else:
-                    # No tracker — original speaking animation
-                    drift_yaw = 1.5 * math.sin(2 * math.pi * t / 7.0)
                     pose = create_head_pose(
-                        z=bob_z,
-                        pitch=bob_pitch,
-                        yaw=drift_yaw + emphasis_yaw * emphasis_decay,
-                        roll=drift_roll,
+                        z=gz,
+                        pitch=gpitch,
+                        yaw=gyaw,
+                        roll=groll,
                         degrees=True,
                         mm=True,
                     )
                 self._send_head_pose(pose)
-
-                # Talking antennas: speech-rhythm sway, amplitude follows
-                # audio level so quiet speech = small movement, loud = bigger.
-                ant_amp = 0.10 + 0.35 * amp  # radians
-                ant_phase = 2 * math.pi * t * 2.2
-                ant_r = ant_amp * math.sin(ant_phase)
-                ant_l = ant_amp * math.sin(ant_phase + math.pi * 0.7)
-                self._send_antennas([ant_r, ant_l])
+                self._send_antennas([gant_r, gant_l])
             else:
-                # Idle: face tracking if tracker+camera available, else drift.
+                # Idle — face tracking + periodic random emotion clips.
+                # Only play clips when nobody is talking (robot nor human).
+                # _speech_amp is raised by notify_audio when the mic picks
+                # up audio; if it's above 0.15, someone is likely speaking.
+                now_rt = time.time()
+                human_speaking = self._speech_amp > 0.15
 
-                if self._tracker is not None and (self._frame_source is not None or self._camera is not None):
-                    frame = self._frame_source() if self._frame_source is not None else self._camera.grab()
-                    if frame is not None:
-                        self._tracker.submit(frame)
-                    det = self._tracker.get()
-                    now_ts = time.time()
-                    if det is not None and (now_ts - det.timestamp) < _TRACK_COAST_S:
-                        ex = det.err_x
-                        ey = det.err_y
-                        self._track_smooth_ex += 0.5 * (ex - self._track_smooth_ex)
-                        self._track_smooth_ey += 0.5 * (ey - self._track_smooth_ey)
-                        sx = self._track_smooth_ex
-                        sy = self._track_smooth_ey
-                        if abs(sx) > _TRACK_DEADZONE:
-                            face_yaw = self._track_yaw + _YAW_SIGN * sx * _HALF_HFOV * _TRACK_LEAD_GAIN
-                        if abs(sy) > _TRACK_DEADZONE:
-                            face_pitch = self._track_pitch + _PITCH_SIGN * sy * _HALF_VFOV * _TRACK_LEAD_GAIN
-                        self._track_last_seen = now_ts
+                # Reset timer while anyone is speaking so we get a fresh
+                # 5-10s quiet window before the next clip.
+                if human_speaking:
+                    last_emotion_clip = now_rt
 
-                if face_yaw is not None:
-                    face_yaw = max(-_YAW_LIMIT, min(_YAW_LIMIT, face_yaw))
-                    self._track_yaw += _TRACK_ALPHA * (face_yaw - self._track_yaw)
-                else:
-                    if (time.time() - self._track_last_seen) > _TRACK_RECENTER_AFTER_S:
-                        self._track_yaw *= _TRACK_RECENTER_DECAY
+                # Play a random emotion clip every 5-10s of silence.
+                if not human_speaking and (now_rt - last_emotion_clip) > next_emotion_delay:
+                    last_emotion_clip = now_rt
+                    next_emotion_delay = random.uniform(5.0, 10.0)
+                    emotion = random.choice(_IDLE_EMOTIONS)
+                    log.info("[Idle] Emotion clip: %s", emotion)
+                    self.show_expression(emotion)
+                    # show_expression blocks during clip + smooth return.
+                    continue
 
-                if face_pitch is not None:
-                    face_pitch = max(-_PITCH_LIMIT, min(_PITCH_LIMIT, face_pitch))
-                    self._track_pitch += _TRACK_ALPHA * (face_pitch - self._track_pitch)
-                else:
-                    if (time.time() - self._track_last_seen) > _TRACK_RECENTER_AFTER_S:
-                        self._track_pitch *= _TRACK_RECENTER_DECAY
-
-                if self._tracker is not None and (self._frame_source is not None or self._camera is not None):
-                    # Face-tracking mode: head follows face, antennas breathe
+                # Between emotion clips: simple face tracking + gentle sway.
+                if has_tracker:
                     roll = 0.5 * math.sin(2 * math.pi * t / 9.0)
                     pose = create_head_pose(
                         roll=roll,
@@ -460,16 +579,12 @@ class RobotController:
                     ant_l = 0.12 * math.sin(2 * math.pi * t / 7.1 + 0.8)
                     self._send_antennas([ant_r, ant_l])
                 else:
-                    # No tracker — original drift behavior
-                    if t > next_drift:
-                        target_yaw = random.uniform(-2.5, 2.5)
-                        next_drift = t + random.uniform(5.0, 9.0)
-                    yaw_off += (target_yaw - yaw_off) * 0.015
                     roll = 0.7 * math.sin(2 * math.pi * t / 9.0)
+                    drift_yaw = 2.0 * math.sin(2 * math.pi * t / 7.0)
                     pose = create_head_pose(
                         roll=roll,
                         pitch=0,
-                        yaw=yaw_off,
+                        yaw=drift_yaw,
                         degrees=True,
                         mm=True,
                     )
@@ -488,31 +603,62 @@ class RobotController:
         return self._emotions
 
     def show_expression(self, name: str) -> bool:
-        """Play a recorded emotion clip (motion + sound).
+        """Play a recorded emotion clip (motion + sound) with smooth transitions.
 
-        Pauses the animation loop and plays the clip at its natural duration.
-        Works even if speaking or idle animation is running — the expression
-        takes full priority until it finishes.
+        Pauses the idle/animation loop, smoothly transitions to the clip's
+        starting pose, plays the full clip with sound, then smoothly
+        transitions back to the face-tracking pose.
         """
         try:
             self._expression_active.set()
             # Give the idle loop one cycle to see the flag and yield so
             # it doesn't send a conflicting head pose mid-expression.
-            time.sleep(0.06)
+            time.sleep(0.08)
+
             moves = self._load_emotions()
             move = moves.get(name)
             if move is None:
                 self._expression_active.clear()
                 log.warning("Expression '%s' not found in library", name)
                 return False
-            self.reachy.play_move(move, sound=True)
-            log.info("Played emotion '%s' (%.2fs)", name, move.duration)
+
+            log.info("Playing emotion '%s' (%.2fs) with sound...", name, move.duration)
+
+            # Use asyncio.run to call async_play_move directly instead of
+            # the async_to_sync wrapper (asgiref). This avoids potential
+            # event-loop conflicts when called from asyncio.to_thread.
+            # initial_goto_duration smoothly moves to the clip's start pose.
+            asyncio.run(self.reachy.async_play_move(
+                move, sound=True, initial_goto_duration=0.3,
+            ))
+
+            log.info("Emotion '%s' finished.", name)
+
+            # Smooth transition back to the current tracking pose so the
+            # head doesn't snap from the clip's final pose to the tracking
+            # pose.
+            self._smooth_return_to_tracking()
+
             self._expression_active.clear()
             return True
         except Exception as e:
             self._expression_active.clear()
             log.warning("Expression '%s' failed: %s", name, e)
             return False
+
+    def _smooth_return_to_tracking(self, duration: float = 0.4) -> None:
+        """Smoothly move the head back to the current tracking pose."""
+        try:
+            self.reachy.goto_target(
+                head=head_pose(
+                    roll=0.0,
+                    pitch=self._track_pitch,
+                    yaw=self._track_yaw,
+                ),
+                duration=duration,
+            )
+        except Exception:
+            pass
 
     def list_expressions(self) -> List[str]:
         try:
@@ -527,7 +673,7 @@ class RobotController:
     def move_head(self, yaw_deg: float, pitch_deg: float, duration: float = 0.3) -> None:
         """Smoothly move the head to a yaw/pitch angle (degrees)."""
         self._expression_active.set()
-        time.sleep(0.06)
+        time.sleep(0.08)
         self.reachy.goto_target(
             head=head_pose(
                 roll=0.0,
@@ -536,6 +682,8 @@ class RobotController:
             ),
             duration=duration,
         )
+        # Smooth transition back to tracking pose
+        self._smooth_return_to_tracking()
         self._expression_active.clear()
         log.info("Head moved to yaw=%.1f pitch=%.1f (dur=%.2fs)", yaw_deg, pitch_deg, duration)
 
